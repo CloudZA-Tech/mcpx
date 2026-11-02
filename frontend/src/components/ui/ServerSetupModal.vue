@@ -118,7 +118,7 @@ import {
   ExclamationTriangleIcon,
   LockOpenIcon
 } from '@heroicons/vue/24/outline'
-import api from '@/api/client'
+import api, { apiErrorMessage } from '@/api/client'
 import { startOAuthFlow } from '@/lib/mcp'
 
 const props = defineProps<{
@@ -194,8 +194,7 @@ async function startSetup() {
     await testConnectivity()
     
   } catch (e: unknown) {
-    const errMsg = e instanceof Error ? e.message : 'Failed to create server'
-    error.value = errMsg
+    error.value = apiErrorMessage(e, 'Failed to create server')
   }
 }
 
@@ -241,7 +240,7 @@ async function startAuth() {
     const server = serverResponse.data
     
 
-    const result = await startOAuthFlow(createdServerName.value, server.url)
+    const result = await startOAuthFlow(createdServerName.value, server.url, server.oauth_client_id)
     
     if (result.success) {
   

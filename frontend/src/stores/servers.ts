@@ -15,6 +15,7 @@ export interface Server {
     health_error: string | null
     proxy_url: string
     rate_limit_per_minute: number | null
+    oauth_client_id: string | null
     created_at: string
     updated_at: string
 }

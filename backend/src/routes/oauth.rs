@@ -11,9 +11,16 @@ use uuid::Uuid;
 use crate::messages::error;
 use crate::middleware::auth::AuthUser;
 use crate::services::crypto;
+use crate::services::health_check::discover_oauth_endpoints;
 use crate::AppState;
 
 const SQL_SELECT_SERVER_ID: &str = "SELECT id FROM servers WHERE name = $1 AND org_id = $2";
+
+const SQL_SELECT_SERVER_OAUTH_CONFIG: &str =
+    "SELECT id, url, oauth_client_id, oauth_token_url FROM servers WHERE name = $1 AND org_id = $2";
+
+const SQL_SELECT_CLIENT_SECRET: &str =
+    "SELECT encrypted_value FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
 
 const SQL_UPSERT_OAUTH_TOKENS: &str = r#"
     INSERT INTO oauth_tokens (server_id, org_id, access_token_encrypted, refresh_token_encrypted, token_type, expires_at, scope, dynamic_client_id)
@@ -52,6 +59,13 @@ pub struct OAuthStatusResponse {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ExchangeCodeRequest {
+    pub code: String,
+    pub code_verifier: String,
+    pub redirect_uri: String,
+}
+
 pub async fn store_oauth_tokens(
     State(state): State<Arc<AppState>>,
     Path(server_name): Path<String>,
@@ -73,6 +87,159 @@ pub async fn store_oauth_tokens(
     let server_id =
         server_id.ok_or((StatusCode::NOT_FOUND, error::SERVER_NOT_FOUND.to_string()))?;
 
+    save_tokens(&state, server_id, auth_user.org_id, tokens).await?;
+
+    Ok(StatusCode::CREATED)
+}
+
+/// Exchange an authorization code for tokens using the server's pre-registered
+/// client. Done server-side so the client secret never reaches the browser.
+pub async fn exchange_oauth_code(
+    State(state): State<Arc<AppState>>,
+    Path(server_name): Path<String>,
+    auth_user: AuthUser,
+    Json(req): Json<ExchangeCodeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let row: Option<(Uuid, String, Option<String>, Option<String>)> =
+        sqlx::query_as(SQL_SELECT_SERVER_OAUTH_CONFIG)
+            .bind(&server_name)
+            .bind(auth_user.org_id)
+            .fetch_optional(&state.db.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{}: {}", error::DATABASE_ERROR, e),
+                )
+            })?;
+
+    let (server_id, server_url, client_id, token_url) =
+        row.ok_or((StatusCode::NOT_FOUND, error::SERVER_NOT_FOUND.to_string()))?;
+
+    let client_id = client_id.filter(|id| !id.is_empty()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Server has no OAuth client ID configured".to_string(),
+    ))?;
+
+    let token_url = match token_url.filter(|url| !url.is_empty()) {
+        Some(url) => url,
+        None => discover_oauth_endpoints(&server_url)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?
+            .0,
+    };
+
+    let key = crypto::derive_key(&state.config.encryption_key);
+
+    let client_secret: Option<String> = sqlx::query_scalar(SQL_SELECT_CLIENT_SECRET)
+        .bind(server_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::DATABASE_ERROR, e),
+            )
+        })?
+        .and_then(|encrypted: String| crypto::decrypt(&encrypted, &key).ok());
+
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", req.code.as_str()),
+        ("redirect_uri", req.redirect_uri.as_str()),
+        ("code_verifier", req.code_verifier.as_str()),
+        ("client_id", client_id.as_str()),
+    ];
+    if let Some(ref secret) = client_secret {
+        form.push(("client_secret", secret.as_str()));
+    }
+
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .post(&token_url)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to call token endpoint: {}", e),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            "Token exchange failed for {}: status={}, body={}",
+            server_name,
+            status,
+            body.chars().take(500).collect::<String>()
+        );
+
+        // Only surface the standard OAuth error fields, never the raw upstream body
+        #[derive(Deserialize)]
+        struct OAuthError {
+            error: String,
+            error_description: Option<String>,
+        }
+        let detail = match serde_json::from_str::<OAuthError>(&body) {
+            Ok(e) => match e.error_description {
+                Some(desc) => format!(": {} ({})", e.error, desc),
+                None => format!(": {}", e.error),
+            },
+            Err(_) => String::new(),
+        };
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Token endpoint returned {}{}", status, detail),
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        refresh_token: Option<String>,
+        token_type: Option<String>,
+        expires_in: Option<i64>,
+        scope: Option<String>,
+    }
+
+    let tokens: TokenResponse = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to parse token response: {}", e),
+        )
+    })?;
+
+    save_tokens(
+        &state,
+        server_id,
+        auth_user.org_id,
+        StoreTokensRequest {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            token_type: tokens.token_type,
+            expires_in: tokens.expires_in,
+            scope: tokens.scope,
+            client_id: Some(client_id),
+        },
+    )
+    .await?;
+
+    tracing::info!("OAuth code exchanged and tokens stored for {}", server_name);
+
+    Ok(StatusCode::CREATED)
+}
+
+async fn save_tokens(
+    state: &AppState,
+    server_id: Uuid,
+    org_id: Uuid,
+    tokens: StoreTokensRequest,
+) -> Result<(), (StatusCode, String)> {
     let key = crypto::derive_key(&state.config.encryption_key);
 
     let access_encrypted = crypto::encrypt(&tokens.access_token, &key).map_err(|e| {
@@ -98,7 +265,7 @@ pub async fn store_oauth_tokens(
 
     sqlx::query(SQL_UPSERT_OAUTH_TOKENS)
         .bind(server_id)
-        .bind(auth_user.org_id)
+        .bind(org_id)
         .bind(&access_encrypted)
         .bind(&refresh_encrypted)
         .bind(tokens.token_type.unwrap_or_else(|| "Bearer".to_string()))
@@ -114,7 +281,7 @@ pub async fn store_oauth_tokens(
             )
         })?;
 
-    Ok(StatusCode::CREATED)
+    Ok(())
 }
 
 pub async fn oauth_status(

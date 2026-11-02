@@ -208,11 +208,7 @@ async fn get_oauth_client_credentials_header<S: AuthenticableServer>(
     let client = reqwest::Client::new();
     let token_response = client
         .post(&token_url)
-        .json(&serde_json::json!({
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": secret
-        }))
+        .form(&[("grant_type", "client_credentials"), ("client_id", client_id.as_str()), ("client_secret", secret.as_str())])
         .send()
         .await;
 

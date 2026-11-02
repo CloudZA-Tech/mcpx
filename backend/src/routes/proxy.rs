@@ -1589,11 +1589,7 @@ async fn build_auth_headers(
                     let client = reqwest::Client::new();
                     let token_response = client
                         .post(&token_url)
-                        .json(&serde_json::json!({
-                            "grant_type": "client_credentials",
-                            "client_id": client_id,
-                            "client_secret": client_secret
-                        }))
+                        .form(&[("grant_type", "client_credentials"), ("client_id", client_id.as_str()), ("client_secret", client_secret.as_str())])
                         .send()
                         .await
                         .map_err(|e| format!("Failed to fetch token: {}", e))?;
@@ -1677,8 +1673,15 @@ async fn get_oauth_token(state: &AppState, server: &ServerRow) -> Result<Option<
 
     if let Some((encrypted, expires_at)) = row {
         if let Some(exp) = expires_at {
-            if exp < chrono::Utc::now() {
-                return Err("OAuth token expired".to_string());
+            if exp < chrono::Utc::now() + chrono::Duration::seconds(60) {
+                return crate::services::health_check::try_refresh_token(
+                    &state.db,
+                    server.id,
+                    &state.config.encryption_key,
+                )
+                .await
+                .map(Some)
+                .map_err(|e| format!("OAuth token expired and refresh failed: {}", e));
             }
         }
 
@@ -1767,11 +1770,7 @@ async fn get_server_auth_headers(
                 let client = reqwest::Client::new();
                 let token_response = client
                     .post(&token_url)
-                    .json(&serde_json::json!({
-                        "grant_type": "client_credentials",
-                        "client_id": client_id,
-                        "client_secret": secret
-                    }))
+                    .form(&[("grant_type", "client_credentials"), ("client_id", client_id.as_str()), ("client_secret", secret.as_str())])
                     .send()
                     .await;
 

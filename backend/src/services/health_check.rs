@@ -153,11 +153,7 @@ async fn check_single_server(
                     let client = reqwest::Client::new();
                     let token_response = client
                         .post(&token_url)
-                        .json(&serde_json::json!({
-                            "grant_type": "client_credentials",
-                            "client_id": client_id,
-                            "client_secret": secret
-                        }))
+                        .form(&[("grant_type", "client_credentials"), ("client_id", client_id.as_str()), ("client_secret", secret.as_str())])
                         .send()
                         .await;
 
@@ -276,8 +272,9 @@ async fn get_access_token(
 
     if let Some((encrypted, expires_at)) = row {
         if let Some(exp) = expires_at {
-            if exp < Utc::now() {
-                return Ok(None);
+            if exp < Utc::now() + chrono::Duration::seconds(60) {
+                // Expired or about to expire - try to refresh before giving up
+                return Ok(try_refresh_token(db, server_id, encryption_key).await.ok());
             }
         }
 
@@ -292,7 +289,7 @@ async fn get_access_token(
 }
 
 /// Discover OAuth endpoints from the server's well-known metadata (for oauth_auto mode)
-async fn discover_oauth_endpoints(server_url: &str) -> Result<(String, String), String> {
+pub async fn discover_oauth_endpoints(server_url: &str) -> Result<(String, String), String> {
     let client = reqwest::Client::new();
 
     // Parse the server URL to get the base
@@ -380,7 +377,7 @@ async fn discover_oauth_endpoints(server_url: &str) -> Result<(String, String), 
     Ok((asm.token_endpoint, client_id))
 }
 
-async fn try_refresh_token(
+pub async fn try_refresh_token(
     db: &Database,
     server_id: Uuid,
     encryption_key: &str,
@@ -434,32 +431,35 @@ async fn try_refresh_token(
         effective_client_id
     );
 
+    // Pre-registered confidential clients (e.g. HubSpot) also need their secret
+    let client_secret: Option<String> = sqlx::query_scalar(
+        "SELECT encrypted_value FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'"
+    )
+    .bind(server_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| format!("Failed to fetch client secret: {}", e))?
+    .and_then(|encrypted: String| crypto::decrypt(&encrypted, &key).ok());
+
     // 4. Call token endpoint with refresh_token grant
     // Some OAuth servers (public clients) don't require client_id
-    let client = reqwest::Client::new();
-    let token_response = if let Some(ref cid) = effective_client_id {
-        client
-            .post(&token_url)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
-                ("client_id", cid.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("Failed to call token endpoint: {}", e))?
-    } else {
-        // Try without client_id (public client / PKCE flow)
-        client
-            .post(&token_url)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("Failed to call token endpoint: {}", e))?
-    };
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(ref cid) = effective_client_id {
+        form.push(("client_id", cid.as_str()));
+    }
+    if let Some(ref secret) = client_secret {
+        form.push(("client_secret", secret.as_str()));
+    }
+
+    let token_response = reqwest::Client::new()
+        .post(&token_url)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to call token endpoint: {}", e))?;
 
     if !token_response.status().is_success() {
         let status = token_response.status();

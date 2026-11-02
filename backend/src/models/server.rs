@@ -81,6 +81,8 @@ pub struct ServerResponse {
     pub health_error: Option<String>,
     pub proxy_url: String,
     pub rate_limit_per_minute: Option<i32>,
+    /// Pre-registered OAuth client ID (public; the secret is never returned)
+    pub oauth_client_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -102,6 +104,7 @@ impl ServerResponse {
             health_error: server.health_error,
             proxy_url: format!("{}/mcp/{}/{}", base_url, org_slug, server.name),
             rate_limit_per_minute: server.rate_limit_per_minute,
+            oauth_client_id: server.oauth_client_id.filter(|id| !id.is_empty()),
             created_at: server.created_at,
             updated_at: server.updated_at,
         }

@@ -12,7 +12,7 @@ import { auth } from '@modelcontextprotocol/sdk/client/auth';
 // @ts-expect-error - SDK subpath exports work at runtime but not in TypeScript
 import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth';
 import { McpxOAuthProvider } from './oauthProvider';
-import api from '@/api/client';
+import api, { apiErrorMessage } from '@/api/client';
 
 export interface OAuthResult {
     success: boolean;
@@ -24,17 +24,20 @@ export interface OAuthResult {
  * 
  * @param serverName - Name of the server in mcpx
  * @param serverUrl - URL of the upstream MCP server
+ * @param clientId - Pre-registered client ID, for servers without dynamic registration
  * @returns Promise that resolves when OAuth flow completes
  */
 export async function startOAuthFlow(
     serverName: string,
-    serverUrl: string
+    serverUrl: string,
+    clientId?: string | null
 ): Promise<OAuthResult> {
     const provider = new McpxOAuthProvider(
         {
             serverUrl,
             serverName,
-            backendUrl: ''
+            backendUrl: '',
+            clientId: clientId || undefined
         },
         async (tokens: OAuthTokens, clientId?: string) => {
 
@@ -86,11 +89,15 @@ export async function handleOAuthCallback(
         return { success: false, error: 'OAuth state not found' };
     }
 
-    let savedState: { serverUrl: string; serverName: string };
+    let savedState: { serverUrl: string; serverName: string; clientId?: string };
     try {
         savedState = JSON.parse(stateJson);
     } catch {
         return { success: false, error: 'Invalid OAuth state' };
+    }
+
+    if (savedState.clientId) {
+        return exchangeCodeInBackend(serverName, savedState, code);
     }
 
     const provider = new McpxOAuthProvider(
@@ -133,6 +140,38 @@ export async function handleOAuthCallback(
             success: false,
             error: error instanceof Error ? error.message : 'Unknown error'
         };
+    }
+}
+
+/**
+ * Pre-registered clients may need a client secret for the token exchange,
+ * so the backend performs it - the secret never reaches the browser.
+ */
+async function exchangeCodeInBackend(
+    serverName: string,
+    savedState: { serverUrl: string; clientId?: string },
+    code: string
+): Promise<OAuthResult> {
+    const provider = new McpxOAuthProvider({
+        serverUrl: savedState.serverUrl,
+        serverName,
+        backendUrl: '',
+        clientId: savedState.clientId
+    });
+
+    try {
+        provider.restoreState(serverName);
+        await api.post(`/servers/${serverName}/oauth/exchange`, {
+            code,
+            code_verifier: provider.codeVerifier(),
+            redirect_uri: provider.redirectUrl.toString()
+        });
+        return { success: true };
+    } catch (error) {
+        console.error('OAuth code exchange error:', error);
+        return { success: false, error: apiErrorMessage(error, 'Token exchange failed') };
+    } finally {
+        provider.cleanup();
     }
 }
 

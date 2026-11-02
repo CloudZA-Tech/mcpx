@@ -215,6 +215,20 @@
                 <p class="text-sm text-gray-400 mt-1">After creating the server, click "Authorize" to start the OAuth flow. mcpx will automatically discover the OAuth endpoints and open a popup for you to log in.</p>
               </div>
             </div>
+            <div class="mt-4 space-y-4">
+              <p class="text-sm text-gray-400">
+                Some providers (e.g. HubSpot) don't support dynamic client registration. If so, create an app with the provider,
+                set its redirect URL to <code class="text-fuchsia-300">{{ oauthRedirectUrl }}</code>, and enter its credentials below.
+              </p>
+              <div>
+                <label class="block text-sm font-medium mb-2">Client ID (optional)</label>
+                <input v-model="form.oauth_client_id" type="text" class="input" placeholder="Leave empty to register automatically" />
+              </div>
+              <div>
+                <label class="block text-sm font-medium mb-2">Client Secret (optional)</label>
+                <input v-model="form.oauth_client_secret" type="password" class="input" placeholder="Required if the provider issued one" />
+              </div>
+            </div>
           </div>
           
           <!-- Client Credentials fields -->
@@ -327,6 +341,9 @@ import {
 } from '@heroicons/vue/24/outline'
 
 const router = useRouter()
+
+// Must match McpxOAuthProvider.redirectUrl
+const oauthRedirectUrl = `${window.location.origin}/oauth/callback`
 
 const form = reactive({
   name: '',

@@ -431,7 +431,7 @@ async function handleAuthorize() {
   
   try {
 
-    const result = await startOAuthFlow(server.value.name, server.value.url)
+    const result = await startOAuthFlow(server.value.name, server.value.url, server.value.oauth_client_id)
     
     if (result.success) {
   

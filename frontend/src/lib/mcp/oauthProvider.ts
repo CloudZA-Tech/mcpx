@@ -17,6 +17,8 @@ export interface McpxOAuthConfig {
   serverUrl: string;
   serverName: string;
   backendUrl: string;
+  /** Pre-registered client ID - skips dynamic client registration */
+  clientId?: string;
 }
 
 const STATE_PREFIX = 'mcpx:';
@@ -66,6 +68,9 @@ export class McpxOAuthProvider implements OAuthClientProvider {
   }
 
   clientInformation(): OAuthClientInformationMixed | undefined {
+    if (!this._clientInformation && this.config.clientId) {
+      return { client_id: this.config.clientId };
+    }
     return this._clientInformation;
   }
 
@@ -98,6 +103,7 @@ export class McpxOAuthProvider implements OAuthClientProvider {
     sessionStorage.setItem(`mcpx_oauth_state_${this.config.serverName}`, JSON.stringify({
       serverUrl: this.config.serverUrl,
       serverName: this.config.serverName,
+      clientId: this.config.clientId,
       clientInfo: this._clientInformation,
       codeVerifier: this._codeVerifier
     }));
