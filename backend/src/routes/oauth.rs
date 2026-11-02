@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::messages::error;
 use crate::middleware::auth::AuthUser;
 use crate::services::crypto;
-use crate::services::health_check::discover_oauth_endpoints;
+use crate::services::health_check::{discover_oauth_endpoints, discover_oauth_metadata};
 use crate::AppState;
 
 const SQL_SELECT_SERVER_ID: &str = "SELECT id FROM servers WHERE name = $1 AND org_id = $2";
@@ -20,6 +20,15 @@ const SQL_SELECT_SERVER_OAUTH_CONFIG: &str =
     "SELECT id, url, oauth_client_id, oauth_token_url FROM servers WHERE name = $1 AND org_id = $2";
 
 const SQL_PIN_TOKEN_URL: &str = "UPDATE servers SET oauth_token_url = $1 WHERE id = $2";
+
+const SQL_SET_REGISTERED_CLIENT: &str =
+    "UPDATE servers SET oauth_client_id = $1, oauth_token_url = $2 WHERE id = $3";
+
+const SQL_DELETE_CLIENT_SECRET: &str =
+    "DELETE FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
+
+const SQL_INSERT_CLIENT_SECRET: &str =
+    "INSERT INTO credentials (server_id, credential_type, encrypted_value, name) VALUES ($1, 'oauth_client_secret', $2, 'OAuth Client Secret')";
 
 const SQL_SELECT_CLIENT_SECRET: &str =
     "SELECT encrypted_value FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
@@ -59,6 +68,16 @@ pub struct StoreTokensRequest {
 pub struct OAuthStatusResponse {
     pub connected: bool,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterClientRequest {
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterClientResponse {
+    pub client_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,22 +201,9 @@ pub async fn exchange_oauth_code(
             body.chars().take(500).collect::<String>()
         );
 
-        // Only surface the standard OAuth error fields, never the raw upstream body
-        #[derive(Deserialize)]
-        struct OAuthError {
-            error: String,
-            error_description: Option<String>,
-        }
-        let detail = match serde_json::from_str::<OAuthError>(&body) {
-            Ok(e) => match e.error_description {
-                Some(desc) => format!(": {} ({})", e.error, desc),
-                None => format!(": {}", e.error),
-            },
-            Err(_) => String::new(),
-        };
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("Token endpoint returned {}{}", status, detail),
+            format!("Token endpoint returned {}{}", status, oauth_error_detail(&body)),
         ));
     }
 
@@ -251,6 +257,157 @@ pub async fn exchange_oauth_code(
     tracing::info!("OAuth code exchanged and tokens stored for {}", server_name);
 
     Ok(StatusCode::CREATED)
+}
+
+/// Register mcpx as an OAuth client via dynamic client registration.
+/// Done server-side because some providers (e.g. Granola) omit CORS headers on
+/// their registration and token responses, so a browser can't read them.
+/// The resulting client is stored on the server, which then behaves like a
+/// pre-registered one (backend code exchange, pinned token endpoint).
+pub async fn register_oauth_client(
+    State(state): State<Arc<AppState>>,
+    Path(server_name): Path<String>,
+    auth_user: AuthUser,
+    Json(req): Json<RegisterClientRequest>,
+) -> Result<Json<RegisterClientResponse>, (StatusCode, String)> {
+    let db_err = |e: sqlx::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{}: {}", error::DATABASE_ERROR, e),
+        )
+    };
+
+    let row: Option<(Uuid, String, Option<String>, Option<String>)> =
+        sqlx::query_as(SQL_SELECT_SERVER_OAUTH_CONFIG)
+            .bind(&server_name)
+            .bind(auth_user.org_id)
+            .fetch_optional(&state.db.pool)
+            .await
+            .map_err(db_err)?;
+
+    let (server_id, server_url, client_id, _) =
+        row.ok_or((StatusCode::NOT_FOUND, error::SERVER_NOT_FOUND.to_string()))?;
+
+    if let Some(client_id) = client_id.filter(|id| !id.is_empty()) {
+        return Ok(Json(RegisterClientResponse { client_id }));
+    }
+
+    let endpoints = discover_oauth_metadata(&server_url)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    let registration_endpoint = endpoints.registration_endpoint.ok_or((
+        StatusCode::BAD_REQUEST,
+        "This server does not support dynamic client registration. Create an OAuth app with the provider and enter its client ID and secret.".to_string(),
+    ))?;
+
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .post(&registration_endpoint)
+        .json(&serde_json::json!({
+            "client_name": format!("mcpx-{}", server_name),
+            "redirect_uris": [req.redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to call registration endpoint: {}", e),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            "Client registration failed for {}: status={}, body={}",
+            server_name,
+            status,
+            body.chars().take(500).collect::<String>()
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Registration endpoint returned {}{}",
+                status,
+                oauth_error_detail(&body)
+            ),
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct RegistrationResponse {
+        client_id: String,
+        client_secret: Option<String>,
+    }
+
+    let registration: RegistrationResponse = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to parse registration response: {}", e),
+        )
+    })?;
+
+    let mut tx = state.db.pool.begin().await.map_err(db_err)?;
+
+    sqlx::query(SQL_SET_REGISTERED_CLIENT)
+        .bind(&registration.client_id)
+        .bind(&endpoints.token_endpoint)
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+    if let Some(secret) = registration.client_secret.filter(|s| !s.is_empty()) {
+        let key = crypto::derive_key(&state.config.encryption_key);
+        let encrypted = crypto::encrypt(&secret, &key).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::ENCRYPTION_ERROR, e),
+            )
+        })?;
+        sqlx::query(SQL_DELETE_CLIENT_SECRET)
+            .bind(server_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(SQL_INSERT_CLIENT_SECRET)
+            .bind(server_id)
+            .bind(&encrypted)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+
+    tx.commit().await.map_err(db_err)?;
+
+    tracing::info!("Registered OAuth client for {}", server_name);
+
+    Ok(Json(RegisterClientResponse {
+        client_id: registration.client_id,
+    }))
+}
+
+/// Only surface the standard OAuth error fields, never the raw upstream body
+fn oauth_error_detail(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct OAuthError {
+        error: String,
+        error_description: Option<String>,
+    }
+    match serde_json::from_str::<OAuthError>(body) {
+        Ok(e) => match e.error_description {
+            Some(desc) => format!(": {} ({})", e.error, desc),
+            None => format!(": {}", e.error),
+        },
+        Err(_) => String::new(),
+    }
 }
 
 async fn save_tokens(

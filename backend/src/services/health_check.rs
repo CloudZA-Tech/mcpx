@@ -288,8 +288,25 @@ async fn get_access_token(
     }
 }
 
+/// OAuth endpoints discovered from a server's well-known metadata
+pub struct DiscoveredOAuthEndpoints {
+    pub token_endpoint: String,
+    pub registration_endpoint: Option<String>,
+}
+
 /// Discover OAuth endpoints from the server's well-known metadata (for oauth_auto mode)
 pub async fn discover_oauth_endpoints(server_url: &str) -> Result<(String, String), String> {
+    let endpoints = discover_oauth_metadata(server_url).await?;
+
+    // For oauth_auto with PKCE, client_id is typically a registered client
+    // We use a placeholder since the token was obtained with dynamic registration
+    // The refresh_token itself carries the client binding
+    let client_id = "mcpx-gateway".to_string();
+
+    Ok((endpoints.token_endpoint, client_id))
+}
+
+pub async fn discover_oauth_metadata(server_url: &str) -> Result<DiscoveredOAuthEndpoints, String> {
     let client = reqwest::Client::new();
 
     // Parse the server URL to get the base
@@ -358,6 +375,7 @@ pub async fn discover_oauth_endpoints(server_url: &str) -> Result<(String, Strin
     #[derive(serde::Deserialize)]
     struct AuthServerMetadata {
         token_endpoint: String,
+        registration_endpoint: Option<String>,
         #[allow(dead_code)]
         grant_types_supported: Option<Vec<String>>,
     }
@@ -369,12 +387,10 @@ pub async fn discover_oauth_endpoints(server_url: &str) -> Result<(String, Strin
 
     tracing::info!("Discovered token endpoint: {}", asm.token_endpoint);
 
-    // For oauth_auto with PKCE, client_id is typically a registered client
-    // We use a placeholder since the token was obtained with dynamic registration
-    // The refresh_token itself carries the client binding
-    let client_id = "mcpx-gateway".to_string();
-
-    Ok((asm.token_endpoint, client_id))
+    Ok(DiscoveredOAuthEndpoints {
+        token_endpoint: asm.token_endpoint,
+        registration_endpoint: asm.registration_endpoint,
+    })
 }
 
 pub async fn try_refresh_token(

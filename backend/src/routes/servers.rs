@@ -52,7 +52,10 @@ const SQL_UPDATE_SERVER: &str = r#"
 
 const SQL_DELETE_SERVER: &str = "DELETE FROM servers WHERE org_id = $1 AND name = $2";
 
-const SQL_CLEAR_PINNED_OAUTH: &str = "UPDATE servers SET oauth_token_url = NULL WHERE id = $1";
+const SQL_CLEAR_PINNED_OAUTH: &str =
+    "UPDATE servers SET oauth_token_url = NULL, oauth_client_id = NULL, status = 'pending_auth' WHERE id = $1";
+
+const SQL_DELETE_SERVER_OAUTH_TOKENS: &str = "DELETE FROM oauth_tokens WHERE server_id = $1";
 
 const SQL_DELETE_CLIENT_SECRET: &str =
     "DELETE FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
@@ -353,30 +356,29 @@ pub async fn update_server(
         })?
         .ok_or((StatusCode::NOT_FOUND, error::SERVER_NOT_FOUND.to_string()))?;
 
-    // The pinned token endpoint was discovered from the old URL. Drop it and the
-    // client secret so the secret can't be sent to a host discovered from the new URL.
+    // OAuth client, pinned token endpoint and tokens all belong to the old URL.
+    // Drop them so no secret or token can be sent to a host derived from the new URL.
     let url_changed = previous.as_ref().is_some_and(|p| p.url != server.url);
     if url_changed && server.auth_type.as_deref() == Some("oauth_auto") {
-        sqlx::query(SQL_CLEAR_PINNED_OAUTH)
-            .bind(server.id)
-            .execute(&state.db.pool)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}: {}", error::DATABASE_ERROR, e),
-                )
-            })?;
-        sqlx::query(SQL_DELETE_CLIENT_SECRET)
-            .bind(server.id)
-            .execute(&state.db.pool)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}: {}", error::DATABASE_ERROR, e),
-                )
-            })?;
+        let db_err = |e: sqlx::Error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::DATABASE_ERROR, e),
+            )
+        };
+        let mut tx = state.db.pool.begin().await.map_err(db_err)?;
+        for sql in [
+            SQL_CLEAR_PINNED_OAUTH,
+            SQL_DELETE_CLIENT_SECRET,
+            SQL_DELETE_SERVER_OAUTH_TOKENS,
+        ] {
+            sqlx::query(sql)
+                .bind(server.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
     }
 
     let base_url = &state.config.base_url;

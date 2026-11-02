@@ -118,6 +118,10 @@ async fn main() {
             post(routes::oauth::store_oauth_tokens),
         )
         .route(
+            "/api/servers/:name/oauth/register",
+            post(routes::oauth::register_oauth_client),
+        )
+        .route(
             "/api/servers/:name/oauth/exchange",
             post(routes::oauth::exchange_oauth_code),
         )

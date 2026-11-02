@@ -12,6 +12,7 @@ import { auth } from '@modelcontextprotocol/sdk/client/auth';
 // @ts-expect-error - SDK subpath exports work at runtime but not in TypeScript
 import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth';
 import { McpxOAuthProvider } from './oauthProvider';
+import axios from 'axios';
 import api, { apiErrorMessage } from '@/api/client';
 
 export interface OAuthResult {
@@ -32,6 +33,25 @@ export async function startOAuthFlow(
     serverUrl: string,
     clientId?: string | null
 ): Promise<OAuthResult> {
+    if (!clientId) {
+        // Register via the backend: some providers omit CORS headers on their
+        // registration/token responses, so the browser can't read them.
+        try {
+            const response = await api.post(`/servers/${serverName}/oauth/register`, {
+                redirect_uri: `${window.location.origin}/oauth/callback`
+            });
+            clientId = response.data.client_id;
+        } catch (error) {
+            // 502 = backend couldn't reach/discover the endpoints; fall back to
+            // in-browser registration via the SDK. Other errors are final.
+            if (!(axios.isAxiosError(error) && error.response?.status === 502)) {
+                console.error('OAuth client registration error:', error);
+                return { success: false, error: apiErrorMessage(error, 'Client registration failed') };
+            }
+            console.warn('Backend client registration failed, falling back to browser:', error);
+        }
+    }
+
     const provider = new McpxOAuthProvider(
         {
             serverUrl,
