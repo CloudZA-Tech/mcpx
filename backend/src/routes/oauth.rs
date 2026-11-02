@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::messages::error;
 use crate::middleware::auth::AuthUser;
+use crate::middleware::permissions::Permission;
 use crate::services::crypto;
 use crate::services::health_check::{discover_oauth_endpoints, discover_oauth_metadata};
 use crate::AppState;
@@ -21,8 +22,8 @@ const SQL_SELECT_SERVER_OAUTH_CONFIG: &str =
 
 const SQL_PIN_TOKEN_URL: &str = "UPDATE servers SET oauth_token_url = $1 WHERE id = $2";
 
-const SQL_SET_REGISTERED_CLIENT: &str =
-    "UPDATE servers SET oauth_client_id = $1, oauth_token_url = $2 WHERE id = $3";
+const SQL_SET_REGISTERED_CLIENT: &str = "UPDATE servers SET oauth_client_id = $1, oauth_token_url = $2 \
+     WHERE id = $3 AND url = $4 AND COALESCE(oauth_client_id, '') = ''";
 
 const SQL_DELETE_CLIENT_SECRET: &str =
     "DELETE FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
@@ -121,6 +122,9 @@ pub async fn exchange_oauth_code(
     auth_user: AuthUser,
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    auth_user.require(Permission::ServersWrite)?;
+    check_redirect_uri(&state, &req.redirect_uri)?;
+
     let row: Option<(Uuid, String, Option<String>, Option<String>)> =
         sqlx::query_as(SQL_SELECT_SERVER_OAUTH_CONFIG)
             .bind(&server_name)
@@ -270,6 +274,9 @@ pub async fn register_oauth_client(
     auth_user: AuthUser,
     Json(req): Json<RegisterClientRequest>,
 ) -> Result<Json<RegisterClientResponse>, (StatusCode, String)> {
+    auth_user.require(Permission::ServersWrite)?;
+    check_redirect_uri(&state, &req.redirect_uri)?;
+
     let db_err = |e: sqlx::Error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -356,13 +363,21 @@ pub async fn register_oauth_client(
 
     let mut tx = state.db.pool.begin().await.map_err(db_err)?;
 
-    sqlx::query(SQL_SET_REGISTERED_CLIENT)
+    // Only apply if the URL wasn't changed (and no client set) while we registered
+    let updated = sqlx::query(SQL_SET_REGISTERED_CLIENT)
         .bind(&registration.client_id)
         .bind(&endpoints.token_endpoint)
         .bind(server_id)
+        .bind(&server_url)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+    if updated.rows_affected() == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "Server configuration changed during registration - please retry".to_string(),
+        ));
+    }
 
     if let Some(secret) = registration.client_secret.filter(|s| !s.is_empty()) {
         let key = crypto::derive_key(&state.config.encryption_key);
@@ -392,6 +407,21 @@ pub async fn register_oauth_client(
     Ok(Json(RegisterClientResponse {
         client_id: registration.client_id,
     }))
+}
+
+/// The redirect URI must be mcpx's own callback page, not an arbitrary URL
+fn check_redirect_uri(state: &AppState, redirect_uri: &str) -> Result<(), (StatusCode, String)> {
+    let expected = format!(
+        "{}/oauth/callback",
+        state.config.frontend_url.trim_end_matches('/')
+    );
+    if redirect_uri != expected {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid redirect URI (expected {})", expected),
+        ));
+    }
+    Ok(())
 }
 
 /// Only surface the standard OAuth error fields, never the raw upstream body
