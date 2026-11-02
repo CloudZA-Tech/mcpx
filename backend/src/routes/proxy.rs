@@ -1681,7 +1681,11 @@ async fn get_oauth_token(state: &AppState, server: &ServerRow) -> Result<Option<
                 )
                 .await
                 .map(Some)
-                .map_err(|e| format!("OAuth token expired and refresh failed: {}", e));
+                .map_err(|e| {
+                    tracing::warn!("OAuth token refresh failed for {}: {}", server.name, e);
+                    "OAuth token expired and refresh failed - re-authorization needed"
+                        .to_string()
+                });
             }
         }
 

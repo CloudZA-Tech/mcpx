@@ -52,6 +52,11 @@ const SQL_UPDATE_SERVER: &str = r#"
 
 const SQL_DELETE_SERVER: &str = "DELETE FROM servers WHERE org_id = $1 AND name = $2";
 
+const SQL_CLEAR_PINNED_OAUTH: &str = "UPDATE servers SET oauth_token_url = NULL WHERE id = $1";
+
+const SQL_DELETE_CLIENT_SECRET: &str =
+    "DELETE FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
+
 // Note: oauth_tokens now uses org_id - tokens are per-org, shared by all members
 const SQL_SELECT_OAUTH_TOKEN: &str =
     "SELECT access_token_encrypted FROM oauth_tokens WHERE server_id = $1 AND org_id = $2";
@@ -318,6 +323,18 @@ pub async fn update_server(
     let org_id = auth.org_id;
     let org_slug = auth.org_slug.clone();
 
+    let previous: Option<Server> = sqlx::query_as(SQL_SELECT_SERVER_BY_NAME)
+        .bind(org_id)
+        .bind(&name)
+        .fetch_optional(&state.db.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::DATABASE_ERROR, e),
+            )
+        })?;
+
     let server = sqlx::query_as::<_, Server>(SQL_UPDATE_SERVER)
         .bind(org_id)
         .bind(&name)
@@ -335,6 +352,32 @@ pub async fn update_server(
             )
         })?
         .ok_or((StatusCode::NOT_FOUND, error::SERVER_NOT_FOUND.to_string()))?;
+
+    // The pinned token endpoint was discovered from the old URL. Drop it and the
+    // client secret so the secret can't be sent to a host discovered from the new URL.
+    let url_changed = previous.as_ref().is_some_and(|p| p.url != server.url);
+    if url_changed && server.auth_type.as_deref() == Some("oauth_auto") {
+        sqlx::query(SQL_CLEAR_PINNED_OAUTH)
+            .bind(server.id)
+            .execute(&state.db.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{}: {}", error::DATABASE_ERROR, e),
+                )
+            })?;
+        sqlx::query(SQL_DELETE_CLIENT_SECRET)
+            .bind(server.id)
+            .execute(&state.db.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{}: {}", error::DATABASE_ERROR, e),
+                )
+            })?;
+    }
 
     let base_url = &state.config.base_url;
 

@@ -19,6 +19,8 @@ const SQL_SELECT_SERVER_ID: &str = "SELECT id FROM servers WHERE name = $1 AND o
 const SQL_SELECT_SERVER_OAUTH_CONFIG: &str =
     "SELECT id, url, oauth_client_id, oauth_token_url FROM servers WHERE name = $1 AND org_id = $2";
 
+const SQL_PIN_TOKEN_URL: &str = "UPDATE servers SET oauth_token_url = $1 WHERE id = $2";
+
 const SQL_SELECT_CLIENT_SECRET: &str =
     "SELECT encrypted_value FROM credentials WHERE server_id = $1 AND credential_type = 'oauth_client_secret'";
 
@@ -121,8 +123,9 @@ pub async fn exchange_oauth_code(
         "Server has no OAuth client ID configured".to_string(),
     ))?;
 
-    let token_url = match token_url.filter(|url| !url.is_empty()) {
-        Some(url) => url,
+    let pinned_token_url = token_url.filter(|url| !url.is_empty());
+    let token_url = match pinned_token_url {
+        Some(ref url) => url.clone(),
         None => discover_oauth_endpoints(&server_url)
             .await
             .map_err(|e| (StatusCode::BAD_GATEWAY, e))?
@@ -228,6 +231,22 @@ pub async fn exchange_oauth_code(
         },
     )
     .await?;
+
+    // Pin the endpoint that worked, so refreshes send the client secret only there
+    // and never to an endpoint discovered at runtime.
+    if pinned_token_url.is_none() {
+        sqlx::query(SQL_PIN_TOKEN_URL)
+            .bind(&token_url)
+            .bind(server_id)
+            .execute(&state.db.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{}: {}", error::DATABASE_ERROR, e),
+                )
+            })?;
+    }
 
     tracing::info!("OAuth code exchanged and tokens stored for {}", server_name);
 

@@ -450,6 +450,11 @@ pub async fn try_refresh_token(
     if let Some(ref cid) = effective_client_id {
         form.push(("client_id", cid.as_str()));
     }
+    // Only send the secret to a pinned/configured endpoint, never a discovered one
+    let token_url_pinned = configured_token_url
+        .as_deref()
+        .is_some_and(|url| !url.is_empty());
+    let client_secret = client_secret.filter(|_| token_url_pinned);
     if let Some(ref secret) = client_secret {
         form.push(("client_secret", secret.as_str()));
     }
