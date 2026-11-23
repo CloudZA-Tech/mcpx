@@ -10,14 +10,18 @@ use uuid::Uuid;
 
 use crate::messages::error;
 use crate::middleware::auth::AuthUser;
+use crate::middleware::permissions::Permission;
 use crate::services::crypto;
 use crate::AppState;
 
 const SQL_SELECT_SERVER_ID: &str = "SELECT id FROM servers WHERE name = $1 AND org_id = $2";
-const SQL_SELECT_CREDENTIALS: &str = "SELECT id, server_id, credential_type, encrypted_value, name, created_at FROM credentials WHERE server_id = $1";
+// The identity secret is managed only through the server's Caller Identity endpoints.
+const SQL_SELECT_CREDENTIALS: &str = "SELECT id, server_id, credential_type, encrypted_value, name, created_at FROM credentials WHERE server_id = $1 AND credential_type <> 'identity_secret'";
 const SQL_INSERT_CREDENTIAL: &str = "INSERT INTO credentials (server_id, credential_type, encrypted_value, name) VALUES ($1, $2, $3, $4) RETURNING id, server_id, credential_type, encrypted_value, name, created_at";
-const SQL_DELETE_CREDENTIAL: &str = "DELETE FROM credentials WHERE id = $1 AND server_id = $2";
-const SQL_COUNT_CREDENTIALS: &str = "SELECT COUNT(*) FROM credentials WHERE server_id = $1";
+const SQL_DELETE_CREDENTIAL: &str =
+    "DELETE FROM credentials WHERE id = $1 AND server_id = $2 AND credential_type <> 'identity_secret'";
+const SQL_COUNT_CREDENTIALS: &str =
+    "SELECT COUNT(*) FROM credentials WHERE server_id = $1 AND credential_type <> 'identity_secret'";
 const SQL_UPDATE_AUTH_TYPE: &str = "UPDATE servers SET auth_type = $1 WHERE id = $2";
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +104,7 @@ pub async fn create_credential(
     auth_user: AuthUser,
     Json(req): Json<CreateCredentialRequest>,
 ) -> Result<Json<CredentialResponse>, (StatusCode, String)> {
+    auth_user.require(Permission::ServersWrite)?;
     if req.credential_type != "api_key" && req.credential_type != "bearer" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -171,6 +176,7 @@ pub async fn delete_credential(
     Path((server_name, credential_id)): Path<(String, Uuid)>,
     auth_user: AuthUser,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    auth_user.require(Permission::ServersWrite)?;
     let server_id = sqlx::query_scalar::<_, Uuid>(SQL_SELECT_SERVER_ID)
         .bind(&server_name)
         .bind(auth_user.org_id)

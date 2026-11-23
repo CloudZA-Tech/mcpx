@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Caller identity forwarding: servers can opt in to receive a signed `X-MCPX-Identity` header (HS256 JWT with the caller's email, organisation role and kind) on every proxied call, so they can enforce per-person access. Each server has its own signing secret, shown once and rotatable. New endpoints: `PUT /api/servers/{name}/identity` and `POST /api/servers/{name}/identity/rotate`.
 - `TRUSTED_PROXY_HOPS`: with MCPx behind a load balancer (set to `1`), Caller Identity also carries the caller's IP address (`ip` claim), read from the proxy-added end of `X-Forwarded-For`, so servers can limit access by network.
 
+### Security
+
+- Caller Identity hardening:
+  - The identity secret is hidden from the credentials endpoints and can't be deleted through them.
+  - Adding or deleting credentials now requires `servers:write`.
+  - A malformed `X-Forwarded-For` line voids the `ip` claim instead of shifting it.
+  - Changing a server's URL turns identity forwarding off and deletes the secret.
+  - One secret per server, enforced in the database. Enabling and rotating run in one locked transaction.
+  - Disabled or deleted service accounts get no identity.
+
 ## [0.9.0] Incubating Release
 
 ### Core Platform
