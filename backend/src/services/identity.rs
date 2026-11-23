@@ -6,12 +6,18 @@
 //! signature, issuer, audience (its MCPx server name) and expiry, then applies its own access rules.
 //!
 //! Callers never supply this header: MCPx builds each upstream request from scratch.
+//!
+//! With `TRUSTED_PROXY_HOPS` set, the identity also carries the caller's IP address (`ip`), so a
+//! server can limit access by network. It is read from the right-hand end of X-Forwarded-For,
+//! the entries appended by MCPx's own proxies, which a caller can't forge.
 
+use axum::http::HeaderMap;
 use chrono::Utc;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 use crate::messages::error;
@@ -45,11 +51,12 @@ pub enum CallerKind {
 }
 
 /// Who is making a proxied call, as established by the proxy's authentication.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Caller {
     pub id: Uuid,
     pub org_id: Uuid,
     pub kind: CallerKind,
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +70,8 @@ pub struct IdentityClaims {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     pub org: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
     pub iat: i64,
     pub exp: i64,
     pub jti: String,
@@ -85,6 +94,7 @@ pub fn build_claims(
         email: email.map(|e| e.trim().to_lowercase()),
         role,
         org: caller.org_id.to_string(),
+        ip: caller.ip.clone(),
         iat: now,
         exp: now + TOKEN_TTL_SECONDS,
         jti: hex_encode(&jti),
@@ -98,6 +108,30 @@ pub fn sign(claims: &IdentityClaims, secret: &str) -> Result<String, String> {
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .map_err(|e| format!("{}: {}", error::JWT_ERROR, e))
+}
+
+/// The caller's IP address as seen by the outermost of `trusted_hops` proxies in front of MCPx.
+///
+/// Each proxy appends the address it received the request from to X-Forwarded-For, so the
+/// client's address is the `trusted_hops`-th entry from the right. Anything further left was
+/// supplied by the client and is ignored. Returns None when not configured or not present.
+pub fn client_ip(headers: &HeaderMap, trusted_hops: usize) -> Option<String> {
+    if trusted_hops == 0 {
+        return None;
+    }
+    let entries: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let entry = entries
+        .len()
+        .checked_sub(trusted_hops)
+        .map(|i| entries[i])?;
+    entry.parse::<IpAddr>().ok().map(|ip| ip.to_string())
 }
 
 /// A new random signing secret for one server (256 bits, URL-safe base64).
@@ -202,7 +236,67 @@ mod tests {
             id: Uuid::new_v4(),
             org_id: Uuid::new_v4(),
             kind: CallerKind::User,
+            ip: None,
         }
+    }
+
+    fn xff(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append("x-forwarded-for", v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_comes_from_the_trusted_end_of_x_forwarded_for() {
+        assert_eq!(
+            client_ip(&xff(&["203.0.113.9"]), 1).as_deref(),
+            Some("203.0.113.9")
+        );
+        // A client-supplied entry on the left is ignored.
+        assert_eq!(
+            client_ip(&xff(&["6.6.6.6, 203.0.113.9"]), 1).as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(&xff(&["6.6.6.6", "203.0.113.9"]), 1).as_deref(),
+            Some("203.0.113.9")
+        );
+        // Two proxies (e.g. CDN + load balancer): the client is second from the right.
+        assert_eq!(
+            client_ip(&xff(&["6.6.6.6, 203.0.113.9, 10.0.0.5"]), 2).as_deref(),
+            Some("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(&xff(&["2001:db8::1"]), 1).as_deref(),
+            Some("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn client_ip_is_absent_when_not_configured_missing_or_invalid() {
+        assert_eq!(client_ip(&xff(&["203.0.113.9"]), 0), None);
+        assert_eq!(client_ip(&HeaderMap::new(), 1), None);
+        assert_eq!(client_ip(&xff(&["203.0.113.9"]), 2), None);
+        assert_eq!(client_ip(&xff(&["not-an-ip"]), 1), None);
+    }
+
+    #[test]
+    fn identity_carries_the_caller_ip_only_when_known() {
+        let now = Utc::now().timestamp();
+        let with_ip = Caller {
+            ip: Some("203.0.113.9".into()),
+            ..user()
+        };
+        let token = sign(&build_claims(&with_ip, "reports", None, None, now), "s").unwrap();
+        assert_eq!(
+            verify(&token, "s", "reports").unwrap().ip.as_deref(),
+            Some("203.0.113.9")
+        );
+
+        let token = sign(&build_claims(&user(), "reports", None, None, now), "s").unwrap();
+        assert!(verify(&token, "s", "reports").unwrap().ip.is_none());
     }
 
     fn verify(token: &str, secret: &str, audience: &str) -> Result<IdentityClaims, String> {

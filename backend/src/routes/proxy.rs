@@ -50,6 +50,8 @@ pub struct AuthResult {
     pub org_id: Uuid,
     /// Scopes from M2M token. None = PAT (full access), Some([]) = no scopes
     pub scopes: Option<Vec<String>>,
+    /// The caller's IP address, when MCPx is told how many proxies to trust (TRUSTED_PROXY_HOPS)
+    pub client_ip: Option<String>,
 }
 
 impl AuthResult {
@@ -71,6 +73,7 @@ impl AuthResult {
             } else {
                 CallerKind::ServiceAccount
             },
+            ip: self.client_ip.clone(),
         }
     }
 }
@@ -138,7 +141,8 @@ pub async fn mcp_proxy(
     );
 
     // Extract and validate authentication - returns AuthResult with scopes
-    let auth = authenticate_request(&state, &headers).await?;
+    let mut auth = authenticate_request(&state, &headers).await?;
+    auth.client_ip = identity::client_ip(&headers, state.config.trusted_proxy_hops);
 
     // Look up org by slug
     let org_id: Uuid = sqlx::query_scalar(SQL_SELECT_ORG_BY_SLUG)
@@ -241,6 +245,7 @@ async fn authenticate_request(
                     user_or_sa_id: pat.user_id,
                     org_id: pat.org_id,
                     scopes: None, // PAT = full access
+                    client_ip: None,
                 })
             }
             None => Err((
@@ -308,6 +313,7 @@ fn validate_m2m_jwt(token: &str, secret: &str) -> Result<AuthResult, (StatusCode
         user_or_sa_id: service_account_id,
         org_id,
         scopes: Some(claims.scopes),
+        client_ip: None,
     })
 }
 
@@ -2153,6 +2159,7 @@ mod tests {
                 user_or_sa_id: Uuid::new_v4(),
                 org_id: Uuid::new_v4(),
                 scopes,
+                client_ip: None,
             }
         }
 
@@ -2196,6 +2203,7 @@ mod tests {
                 user_or_sa_id: Uuid::new_v4(),
                 org_id: Uuid::new_v4(),
                 scopes: None,
+                client_ip: None,
             }
         }
 
@@ -2204,6 +2212,7 @@ mod tests {
                 user_or_sa_id: Uuid::new_v4(),
                 org_id: Uuid::new_v4(),
                 scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
+                client_ip: None,
             }
         }
 
@@ -2402,6 +2411,7 @@ mod authorization_tests {
             user_or_sa_id,
             org_id,
             scopes: None, // PAT full access
+            client_ip: None,
         }
     }
 

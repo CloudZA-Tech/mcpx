@@ -130,9 +130,10 @@ A server can opt in to learn who is calling it. MCPx then adds a signed `X-MCPX-
   | `sub` | user or service account ID |
   | `kind` | `user` or `service_account` |
   | `email`, `role` | the user's email (lowercase) and organisation role; absent for service accounts |
+  | `ip` | the caller's IP address, when `TRUSTED_PROXY_HOPS` is set (taken from the proxy-added end of `X-Forwarded-For`, which callers can't forge); absent otherwise |
   | `org`, `iat`, `exp`, `jti` | organisation ID, issued/expiry times, unique token ID |
 
-- **Verify** the signature, `iss`, `aud` and `exp` on every call, then decide from `email` (or `role`). For example, in Python with PyJWT: `jwt.decode(token, secret, algorithms=["HS256"], audience="my-server", issuer="mcpx")`.
+- **Verify** the signature, `iss`, `aud` and `exp` on every call, then decide from `email` (or `role`), and from `ip` to limit access by network. Treat a missing `ip` as unknown, not as allowed. For example, in Python with PyJWT: `jwt.decode(token, secret, algorithms=["HS256"], audience="my-server", issuer="mcpx")`.
 - **Callers can't forge it:** MCPx builds each upstream request itself, so a header sent by the client is never passed on.
 - Health checks and the admin tool listing are not made on behalf of a user and carry no identity.
 
@@ -426,6 +427,7 @@ kubectl apply -k k8s/overlays/production
 | `BASE_URL` | No | Backend URL for OAuth callbacks |
 | `RUST_LOG` | No | Log level (default: info) |
 | `ENCRYPTION_KEY` | No | AES encryption key (defaults to JWT_SECRET) |
+| `TRUSTED_PROXY_HOPS` | No | Proxies in front of MCPx that append to `X-Forwarded-For` (`1` behind a load balancer). Enables the `ip` claim in Caller Identity (default: 0, no IP forwarded) |
 
 \* At least one OAuth provider is required.
 
