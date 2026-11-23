@@ -11,6 +11,9 @@ pub mod error {
     pub const IDENTITY_SECRET_MISSING: &str =
         "Identity forwarding is on but the server has no identity secret";
     pub const IDENTITY_FORWARDING_FAILED: &str = "Identity forwarding failed";
+    pub const SERVICE_ACCOUNT_NOT_FOUND: &str = "Service account not found or disabled";
+    pub const IDENTITY_SECRET_PROTECTED: &str =
+        "The identity secret is managed on the server's Caller Identity settings";
     pub const IDENTITY_NOT_ENABLED: &str =
         "Identity forwarding is off for this server; turn it on first";
     pub const INVALID_USER_ID: &str = "Invalid user ID";

@@ -55,6 +55,9 @@ const SQL_DELETE_SERVER: &str = "DELETE FROM servers WHERE org_id = $1 AND name 
 const SQL_SET_FORWARD_IDENTITY: &str =
     "UPDATE servers SET forward_identity = $1, updated_at = NOW() WHERE id = $2";
 
+const SQL_LOCK_SERVER_IDENTITY: &str =
+    "SELECT forward_identity FROM servers WHERE id = $1 FOR UPDATE";
+
 const SQL_CLEAR_PINNED_OAUTH: &str =
     "UPDATE servers SET oauth_token_url = NULL, oauth_client_id = NULL, status = 'pending_auth' WHERE id = $1";
 
@@ -341,6 +344,23 @@ pub async fn update_server(
             )
         })?;
 
+    // Signed identities belong to the server's current host. Before pointing the server at a
+    // new URL, turn forwarding off and drop the secret, so the new host never receives tokens
+    // the old host still trusts. An admin turns it on again and gives the new operator a new secret.
+    let identity_reset = match (&previous, &payload.url) {
+        (Some(p), Some(url)) if &p.url != url && p.forward_identity => {
+            let mut tx = state.db.pool.begin().await.map_err(db_error_response)?;
+            lock_server(&mut tx, p.id).await?;
+            set_flag(&mut tx, p.id, false).await?;
+            crate::services::identity::delete_secret(&mut tx, p.id)
+                .await
+                .map_err(internal)?;
+            tx.commit().await.map_err(db_error_response)?;
+            true
+        }
+        _ => false,
+    };
+
     let server = sqlx::query_as::<_, Server>(SQL_UPDATE_SERVER)
         .bind(org_id)
         .bind(&name)
@@ -399,7 +419,8 @@ pub async fn update_server(
             "url": &server.url,
             "transport": &server.transport,
             "auth_type": &server.auth_type,
-            "enabled": server.enabled
+            "enabled": server.enabled,
+            "identity_forwarding_reset": identity_reset
         })),
         None,
         None,
@@ -845,8 +866,9 @@ fn internal(e: String) -> (StatusCode, String) {
 }
 
 /// Turn identity forwarding on or off for one server.
-/// Turning it on creates the server's signing secret (returned once) if it has none.
-/// The secret is stored before the flag is set, so calls never go out flagged but unsigned.
+/// Turning it on creates the server's signing secret (returned once) if it has none. The server
+/// row is locked and the secret and flag change in one transaction, so concurrent requests can't
+/// interleave and calls never go out flagged but unsigned.
 pub async fn set_identity_forwarding(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
@@ -856,30 +878,32 @@ pub async fn set_identity_forwarding(
     use crate::services::identity;
     auth.require(Permission::ServersWrite)?;
     let server = find_server(&state, auth.org_id, &name).await?;
-    let pool = &state.db.pool;
 
+    let mut tx = state.db.pool.begin().await.map_err(db_error_response)?;
+    lock_server(&mut tx, server.id).await?;
     let mut new_secret = None;
     if payload.enabled {
-        if !identity::has_secret(pool, server.id)
+        if !identity::has_secret(&mut tx, server.id)
             .await
             .map_err(internal)?
         {
             new_secret = Some(
-                identity::rotate_secret(pool, &state.config.encryption_key, server.id)
+                identity::rotate_secret(&mut tx, &state.config.encryption_key, server.id)
                     .await
                     .map_err(internal)?,
             );
         }
-        set_flag(&state, server.id, true).await?;
+        set_flag(&mut tx, server.id, true).await?;
     } else {
-        set_flag(&state, server.id, false).await?;
-        identity::delete_secret(pool, server.id)
+        set_flag(&mut tx, server.id, false).await?;
+        identity::delete_secret(&mut tx, server.id)
             .await
             .map_err(internal)?;
     }
+    tx.commit().await.map_err(db_error_response)?;
 
     let _ = crate::services::audit::record_audit_log(
-        pool,
+        &state.db.pool,
         auth.org_id,
         Some(auth.user_id),
         crate::services::audit::actions::SERVER_IDENTITY_UPDATE,
@@ -908,15 +932,18 @@ pub async fn rotate_identity_secret(
     use crate::services::identity;
     auth.require(Permission::ServersWrite)?;
     let server = find_server(&state, auth.org_id, &name).await?;
-    if !server.forward_identity {
+
+    let mut tx = state.db.pool.begin().await.map_err(db_error_response)?;
+    if !lock_server(&mut tx, server.id).await? {
         return Err((
             StatusCode::BAD_REQUEST,
             error::IDENTITY_NOT_ENABLED.to_string(),
         ));
     }
-    let secret = identity::rotate_secret(&state.db.pool, &state.config.encryption_key, server.id)
+    let secret = identity::rotate_secret(&mut tx, &state.config.encryption_key, server.id)
         .await
         .map_err(internal)?;
+    tx.commit().await.map_err(db_error_response)?;
 
     let _ = crate::services::audit::record_audit_log(
         &state.db.pool,
@@ -935,23 +962,37 @@ pub async fn rotate_identity_secret(
     Ok(Json(identity_response(&server.name, true, Some(secret))))
 }
 
+fn db_error_response(e: sqlx::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{}: {}", error::DATABASE_ERROR, e),
+    )
+}
+
+/// Locks the server row for this transaction and returns its forward_identity flag.
+async fn lock_server(
+    conn: &mut sqlx::PgConnection,
+    server_id: uuid::Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    sqlx::query_scalar::<_, bool>(SQL_LOCK_SERVER_IDENTITY)
+        .bind(server_id)
+        .fetch_one(conn)
+        .await
+        .map_err(db_error_response)
+}
+
 async fn set_flag(
-    state: &AppState,
+    conn: &mut sqlx::PgConnection,
     server_id: uuid::Uuid,
     on: bool,
 ) -> Result<(), (StatusCode, String)> {
     sqlx::query(SQL_SET_FORWARD_IDENTITY)
         .bind(on)
         .bind(server_id)
-        .execute(&state.db.pool)
+        .execute(conn)
         .await
         .map(|_| ())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{}: {}", error::DATABASE_ERROR, e),
-            )
-        })
+        .map_err(db_error_response)
 }
 
 fn identity_response(

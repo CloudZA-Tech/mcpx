@@ -136,6 +136,8 @@ A server can opt in to learn who is calling it. MCPx then adds a signed `X-MCPX-
 - **Verify** the signature, `iss`, `aud` and `exp` on every call, then decide from `email` (or `role`), and from `ip` to limit access by network. Treat a missing `ip` as unknown, not as allowed. For example, in Python with PyJWT: `jwt.decode(token, secret, algorithms=["HS256"], audience="my-server", issuer="mcpx")`.
 - **Callers can't forge it:** MCPx builds each upstream request itself, so a header sent by the client is never passed on.
 - Health checks and the admin tool listing are not made on behalf of a user and carry no identity.
+- **The secret belongs to the server's current host.** Changing a server's URL turns Caller Identity off and deletes the secret; turn it on again and give the new operator the new secret. Renaming a server changes the `aud` claim, so update what the server expects.
+- The secret is never listed or deletable through the credentials endpoints; manage it only through Caller Identity. Disabled or deleted service accounts get no identity.
 
 ### Gateway Aggregation
 

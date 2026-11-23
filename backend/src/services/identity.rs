@@ -16,7 +16,7 @@ use chrono::Utc;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::net::IpAddr;
 use uuid::Uuid;
 
@@ -38,10 +38,20 @@ const SQL_SELECT_USER_IN_ORG: &str = r#"
     WHERE u.id = $1
 "#;
 
+const SQL_SELECT_SERVICE_ACCOUNT_IN_ORG: &str =
+    "SELECT role FROM service_accounts WHERE id = $1 AND org_id = $2 AND enabled = true";
+
 const SQL_DELETE_IDENTITY_SECRET: &str =
     "DELETE FROM credentials WHERE server_id = $1 AND credential_type = 'identity_secret'";
 
-const SQL_INSERT_IDENTITY_SECRET: &str = "INSERT INTO credentials (server_id, credential_type, encrypted_value, name) VALUES ($1, 'identity_secret', $2, 'Identity signing secret')";
+// One secret per server, enforced by a partial unique index, so concurrent rotations can't
+// leave two rows behind: the last write wins.
+const SQL_UPSERT_IDENTITY_SECRET: &str = r#"
+    INSERT INTO credentials (server_id, credential_type, encrypted_value, name)
+    VALUES ($1, 'identity_secret', $2, 'Identity signing secret')
+    ON CONFLICT (server_id) WHERE credential_type = 'identity_secret'
+    DO UPDATE SET encrypted_value = EXCLUDED.encrypted_value, updated_at = NOW()
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,10 +129,14 @@ pub fn client_ip(headers: &HeaderMap, trusted_hops: usize) -> Option<String> {
     if trusted_hops == 0 {
         return None;
     }
-    let entries: Vec<&str> = headers
-        .get_all("x-forwarded-for")
+    // All or nothing: dropping a line that isn't plain text would shift which entry counts as
+    // trusted, letting a client choose its own address.
+    let mut lines = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        lines.push(value.to_str().ok()?);
+    }
+    let entries: Vec<&str> = lines
         .iter()
-        .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(str::trim)
         .filter(|e| !e.is_empty())
@@ -143,42 +157,36 @@ pub fn generate_secret() -> String {
 }
 
 /// Replaces the server's signing secret and returns the new one. It is shown to the admin once.
+/// Takes a connection so callers can run it inside their own transaction.
 pub async fn rotate_secret(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     encryption_key: &str,
     server_id: Uuid,
 ) -> Result<String, String> {
     let secret = generate_secret();
     let encrypted = crypto::encrypt(&secret, &crypto::derive_key(encryption_key))?;
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    sqlx::query(SQL_DELETE_IDENTITY_SECRET)
-        .bind(server_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query(SQL_INSERT_IDENTITY_SECRET)
+    sqlx::query(SQL_UPSERT_IDENTITY_SECRET)
         .bind(server_id)
         .bind(&encrypted)
-        .execute(&mut *tx)
+        .execute(conn)
         .await
         .map_err(|e| e.to_string())?;
-    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(secret)
 }
 
-pub async fn delete_secret(pool: &PgPool, server_id: Uuid) -> Result<(), String> {
+pub async fn delete_secret(conn: &mut PgConnection, server_id: Uuid) -> Result<(), String> {
     sqlx::query(SQL_DELETE_IDENTITY_SECRET)
         .bind(server_id)
-        .execute(pool)
+        .execute(conn)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
-pub async fn has_secret(pool: &PgPool, server_id: Uuid) -> Result<bool, String> {
+pub async fn has_secret(conn: &mut PgConnection, server_id: Uuid) -> Result<bool, String> {
     let row: Option<(String,)> = sqlx::query_as(SQL_SELECT_IDENTITY_SECRET)
         .bind(server_id)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await
         .map_err(|e| e.to_string())?;
     Ok(row.is_some())
@@ -215,7 +223,17 @@ pub async fn identity_header(
             let (email, role) = row.ok_or_else(|| error::USER_NOT_FOUND.to_string())?;
             (Some(email), Some(role))
         }
-        CallerKind::ServiceAccount => (None, None),
+        CallerKind::ServiceAccount => {
+            // A deleted or disabled service account gets no identity, even if its token is unexpired.
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_SERVICE_ACCOUNT_IN_ORG)
+                .bind(caller.id)
+                .bind(caller.org_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("{}: {}", error::DATABASE_ERROR, e))?;
+            let (role,) = row.ok_or_else(|| error::SERVICE_ACCOUNT_NOT_FOUND.to_string())?;
+            (None, role)
+        }
     };
 
     let claims = build_claims(caller, server_name, email, role, Utc::now().timestamp());
@@ -280,6 +298,18 @@ mod tests {
         assert_eq!(client_ip(&HeaderMap::new(), 1), None);
         assert_eq!(client_ip(&xff(&["203.0.113.9"]), 2), None);
         assert_eq!(client_ip(&xff(&["not-an-ip"]), 1), None);
+    }
+
+    #[test]
+    fn a_line_that_is_not_plain_text_voids_the_whole_header() {
+        // If the bad line were skipped, hops=1 would pick the client's own 10.0.0.7.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "10.0.0.7".parse().unwrap());
+        h.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"\xff, 203.0.113.9").unwrap(),
+        );
+        assert_eq!(client_ip(&h, 1), None);
     }
 
     #[test]
