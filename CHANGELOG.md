@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Caller identity forwarding: servers can opt in to receive a signed `X-MCPX-Identity` header (HS256 JWT with the caller's email, organisation role and kind) on every proxied call, so they can enforce per-person access. Each server has its own signing secret, shown once and rotatable. New endpoints: `PUT /api/servers/{name}/identity` and `POST /api/servers/{name}/identity/rotate`.
+
 ## [0.9.0] Incubating Release
 
 ### Core Platform

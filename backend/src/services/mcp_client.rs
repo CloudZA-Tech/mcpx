@@ -33,12 +33,20 @@ pub async fn list_tools_from_server(
     server_url: &str,
     auth_header_name: Option<&str>,
     auth_header_value: Option<&str>,
+    extra_headers: &[(String, String)],
 ) -> Result<Vec<McpToolInfo>, String> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
     // Build custom headers if auth is provided
     let mut custom_headers = HeaderMap::new();
     if let (Some(name), Some(value)) = (auth_header_name, auth_header_value) {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| format!("Invalid header name: {:?}", e))?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|e| format!("Invalid header value: {:?}", e))?;
+        custom_headers.insert(header_name, header_value);
+    }
+    for (name, value) in extra_headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|e| format!("Invalid header name: {:?}", e))?;
         let header_value =

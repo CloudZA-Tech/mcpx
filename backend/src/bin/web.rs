@@ -102,6 +102,14 @@ async fn main() {
             post(routes::servers::test_server),
         )
         .route(
+            "/api/servers/:name/identity",
+            put(routes::servers::set_identity_forwarding),
+        )
+        .route(
+            "/api/servers/:name/identity/rotate",
+            post(routes::servers::rotate_identity_secret),
+        )
+        .route(
             "/api/servers/:name/credentials",
             get(routes::credentials::list_credentials),
         )

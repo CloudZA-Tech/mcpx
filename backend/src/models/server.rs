@@ -21,6 +21,7 @@ pub struct Server {
     pub oauth_scopes: Option<String>,
     pub oauth_use_pkce: Option<bool>,
     pub rate_limit_per_minute: Option<i32>,
+    pub forward_identity: bool,
 
     pub last_health_check: Option<DateTime<Utc>>,
     pub health_error: Option<String>,
@@ -81,6 +82,8 @@ pub struct ServerResponse {
     pub health_error: Option<String>,
     pub proxy_url: String,
     pub rate_limit_per_minute: Option<i32>,
+    /// Whether MCPx sends this server a signed X-MCPX-Identity header on every proxied call
+    pub forward_identity: bool,
     /// Pre-registered OAuth client ID (public; the secret is never returned)
     pub oauth_client_id: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -104,6 +107,7 @@ impl ServerResponse {
             health_error: server.health_error,
             proxy_url: format!("{}/mcp/{}/{}", base_url, org_slug, server.name),
             rate_limit_per_minute: server.rate_limit_per_minute,
+            forward_identity: server.forward_identity,
             oauth_client_id: server.oauth_client_id.filter(|id| !id.is_empty()),
             created_at: server.created_at,
             updated_at: server.updated_at,
