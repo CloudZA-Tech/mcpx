@@ -259,6 +259,8 @@ pub mod actions {
     pub const SERVER_CREATE: &str = "server.create";
     pub const SERVER_UPDATE: &str = "server.update";
     pub const SERVER_DELETE: &str = "server.delete";
+    pub const SERVER_IDENTITY_UPDATE: &str = "server.identity_update";
+    pub const SERVER_IDENTITY_ROTATE: &str = "server.identity_rotate";
 
     // Gateway actions
     pub const GATEWAY_CREATE: &str = "gateway.create";

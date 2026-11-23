@@ -52,6 +52,9 @@ const SQL_UPDATE_SERVER: &str = r#"
 
 const SQL_DELETE_SERVER: &str = "DELETE FROM servers WHERE org_id = $1 AND name = $2";
 
+const SQL_SET_FORWARD_IDENTITY: &str =
+    "UPDATE servers SET forward_identity = $1, updated_at = NOW() WHERE id = $2";
+
 const SQL_CLEAR_PINNED_OAUTH: &str =
     "UPDATE servers SET oauth_token_url = NULL, oauth_client_id = NULL, status = 'pending_auth' WHERE id = $1";
 
@@ -795,4 +798,172 @@ pub struct TestResult {
 pub struct ToolInfo {
     name: String,
     description: Option<String>,
+}
+
+// ============================================
+// IDENTITY FORWARDING
+// ============================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct IdentityForwardingRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct IdentityForwardingResponse {
+    pub forward_identity: bool,
+    /// Returned only when a new secret is created. Give it to the server's operator; it is not shown again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_secret: Option<String>,
+    pub header: &'static str,
+    pub issuer: &'static str,
+    /// The `aud` claim the server should require: its MCPx server name
+    pub audience: String,
+}
+
+async fn find_server(
+    state: &AppState,
+    org_id: uuid::Uuid,
+    name: &str,
+) -> Result<Server, (StatusCode, String)> {
+    sqlx::query_as::<_, Server>(SQL_SELECT_SERVER_BY_NAME)
+        .bind(org_id)
+        .bind(name)
+        .fetch_optional(&state.db.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::DATABASE_ERROR, e),
+            )
+        })?
+        .ok_or((StatusCode::NOT_FOUND, error::SERVER_NOT_FOUND.to_string()))
+}
+
+fn internal(e: String) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e)
+}
+
+/// Turn identity forwarding on or off for one server.
+/// Turning it on creates the server's signing secret (returned once) if it has none.
+/// The secret is stored before the flag is set, so calls never go out flagged but unsigned.
+pub async fn set_identity_forwarding(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+    Json(payload): Json<IdentityForwardingRequest>,
+) -> Result<Json<IdentityForwardingResponse>, (StatusCode, String)> {
+    use crate::services::identity;
+    auth.require(Permission::ServersWrite)?;
+    let server = find_server(&state, auth.org_id, &name).await?;
+    let pool = &state.db.pool;
+
+    let mut new_secret = None;
+    if payload.enabled {
+        if !identity::has_secret(pool, server.id)
+            .await
+            .map_err(internal)?
+        {
+            new_secret = Some(
+                identity::rotate_secret(pool, &state.config.encryption_key, server.id)
+                    .await
+                    .map_err(internal)?,
+            );
+        }
+        set_flag(&state, server.id, true).await?;
+    } else {
+        set_flag(&state, server.id, false).await?;
+        identity::delete_secret(pool, server.id)
+            .await
+            .map_err(internal)?;
+    }
+
+    let _ = crate::services::audit::record_audit_log(
+        pool,
+        auth.org_id,
+        Some(auth.user_id),
+        crate::services::audit::actions::SERVER_IDENTITY_UPDATE,
+        crate::services::audit::resource_types::SERVER,
+        Some(server.id),
+        Some(&server.name),
+        Some(serde_json::json!({ "forward_identity": payload.enabled, "secret_created": new_secret.is_some() })),
+        None,
+        None,
+    )
+    .await;
+
+    Ok(Json(identity_response(
+        &server.name,
+        payload.enabled,
+        new_secret,
+    )))
+}
+
+/// Replace a server's identity signing secret. The old secret stops working at once.
+pub async fn rotate_identity_secret(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+) -> Result<Json<IdentityForwardingResponse>, (StatusCode, String)> {
+    use crate::services::identity;
+    auth.require(Permission::ServersWrite)?;
+    let server = find_server(&state, auth.org_id, &name).await?;
+    if !server.forward_identity {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            error::IDENTITY_NOT_ENABLED.to_string(),
+        ));
+    }
+    let secret = identity::rotate_secret(&state.db.pool, &state.config.encryption_key, server.id)
+        .await
+        .map_err(internal)?;
+
+    let _ = crate::services::audit::record_audit_log(
+        &state.db.pool,
+        auth.org_id,
+        Some(auth.user_id),
+        crate::services::audit::actions::SERVER_IDENTITY_ROTATE,
+        crate::services::audit::resource_types::SERVER,
+        Some(server.id),
+        Some(&server.name),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    Ok(Json(identity_response(&server.name, true, Some(secret))))
+}
+
+async fn set_flag(
+    state: &AppState,
+    server_id: uuid::Uuid,
+    on: bool,
+) -> Result<(), (StatusCode, String)> {
+    sqlx::query(SQL_SET_FORWARD_IDENTITY)
+        .bind(on)
+        .bind(server_id)
+        .execute(&state.db.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::DATABASE_ERROR, e),
+            )
+        })
+}
+
+fn identity_response(
+    server_name: &str,
+    on: bool,
+    secret: Option<String>,
+) -> IdentityForwardingResponse {
+    IdentityForwardingResponse {
+        forward_identity: on,
+        identity_secret: secret,
+        header: crate::services::identity::IDENTITY_HEADER,
+        issuer: crate::services::identity::ISSUER,
+        audience: server_name.to_string(),
+    }
 }

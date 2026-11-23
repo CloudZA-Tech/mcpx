@@ -116,6 +116,27 @@ Support for multiple authentication methods:
 | Service Accounts | Machine-to-machine communication |
 | API Keys and Bearer Tokens | Credential injection to upstream servers |
 
+### Caller Identity
+
+A server can opt in to learn who is calling it. MCPx then adds a signed `X-MCPX-Identity` header to every request it proxies to that server, directly or through a gateway, so the server can apply its own access rules (for example, "managers only").
+
+- **Turn it on** per server (admins): *Server details → Caller Identity → Turn on*, or `PUT /api/servers/{name}/identity` with `{"enabled": true}`. The response includes the server's signing secret **once**; give it to the server's operator. `POST /api/servers/{name}/identity/rotate` replaces it.
+- **The header** is an HS256 JWT signed with that server's own secret, valid for 60 seconds:
+
+  | Claim | Value |
+  |-------|-------|
+  | `iss` | `mcpx` |
+  | `aud` | the server's MCPx name |
+  | `sub` | user or service account ID |
+  | `kind` | `user` or `service_account` |
+  | `email`, `role` | the user's email (lowercase) and organisation role; absent for service accounts |
+  | `ip` | the caller's IP address, when `TRUSTED_PROXY_HOPS` is set (taken from the proxy-added end of `X-Forwarded-For`, which callers can't forge); absent otherwise |
+  | `org`, `iat`, `exp`, `jti` | organisation ID, issued/expiry times, unique token ID |
+
+- **Verify** the signature, `iss`, `aud` and `exp` on every call, then decide from `email` (or `role`), and from `ip` to limit access by network. Treat a missing `ip` as unknown, not as allowed. For example, in Python with PyJWT: `jwt.decode(token, secret, algorithms=["HS256"], audience="my-server", issuer="mcpx")`.
+- **Callers can't forge it:** MCPx builds each upstream request itself, so a header sent by the client is never passed on.
+- Health checks and the admin tool listing are not made on behalf of a user and carry no identity.
+
 ### Gateway Aggregation
 
 Combine multiple MCP servers into a single endpoint. Connect Claude Desktop to one URL and access all your tools seamlessly.
@@ -406,6 +427,7 @@ kubectl apply -k k8s/overlays/production
 | `BASE_URL` | No | Backend URL for OAuth callbacks |
 | `RUST_LOG` | No | Log level (default: info) |
 | `ENCRYPTION_KEY` | No | AES encryption key (defaults to JWT_SECRET) |
+| `TRUSTED_PROXY_HOPS` | No | Proxies in front of MCPx that append to `X-Forwarded-For` (`1` behind a load balancer). Enables the `ip` claim in Caller Identity (default: 0, no IP forwarded) |
 
 \* At least one OAuth provider is required.
 
@@ -451,6 +473,8 @@ kubectl apply -k k8s/overlays/production
 | GET | `/api/servers/{name}` | Get server |
 | PUT | `/api/servers/{name}` | Update server |
 | DELETE | `/api/servers/{name}` | Delete server |
+| PUT | `/api/servers/{name}/identity` | Turn caller identity forwarding on or off (returns the secret once) |
+| POST | `/api/servers/{name}/identity/rotate` | Replace the identity signing secret |
 
 ### Gateway Management
 

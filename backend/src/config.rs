@@ -14,6 +14,10 @@ pub struct Config {
     pub frontend_url: String,
     pub base_url: String,
     pub backend_port: u16,
+
+    /// Proxies in front of MCPx that append to X-Forwarded-For (1 behind a load balancer).
+    /// 0 (default): the caller's IP is not taken from headers and is not forwarded.
+    pub trusted_proxy_hops: usize,
 }
 
 impl Config {
@@ -38,6 +42,10 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:3000".to_string()),
             base_url,
             backend_port,
+            trusted_proxy_hops: env::var("TRUSTED_PROXY_HOPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         })
     }
 }

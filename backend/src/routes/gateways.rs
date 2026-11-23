@@ -725,6 +725,7 @@ pub async fn list_gateway_tools(
             &server.url,
             auth_header_name.as_deref(),
             auth_header_value.as_deref(),
+            &[],
         )
         .await
         {

@@ -184,6 +184,51 @@
         </div>
       </div>
 
+      <!-- Caller Identity (admin only) -->
+      <div v-if="canWrite" class="card mb-6" data-test="identity-card">
+        <h3 class="font-semibold mb-3 flex items-center gap-2">
+          <IdentificationIcon class="w-5 h-5 text-primary" />
+          Caller Identity
+          <span class="text-sm font-normal" :class="server.forward_identity ? 'text-green-400' : 'text-gray-500'">
+            {{ server.forward_identity ? 'On' : 'Off' }}
+          </span>
+        </h3>
+        <p class="text-sm text-gray-400 mb-4">
+          Sends this server a signed <code>X-MCPX-Identity</code> header on every call, with the caller's email and
+          organisation role, so the server can apply its own access rules.
+        </p>
+        <div class="flex items-center gap-3">
+          <button
+            @click="handleIdentityToggle"
+            :disabled="savingIdentity"
+            class="btn btn-secondary"
+            data-test="identity-toggle"
+          >
+            {{ savingIdentity ? 'Saving...' : server.forward_identity ? 'Turn off' : 'Turn on' }}
+          </button>
+          <button
+            v-if="server.forward_identity"
+            @click="handleIdentityRotate"
+            :disabled="savingIdentity"
+            class="btn btn-secondary"
+            data-test="identity-rotate"
+          >
+            Rotate secret
+          </button>
+        </div>
+        <div v-if="identitySecret" class="mt-4 p-3 rounded-lg border border-yellow-600/50 bg-yellow-900/20 text-sm" data-test="identity-secret">
+          <p class="mb-2">
+            <strong>Copy this secret now: it is shown only once.</strong> The server verifies HS256 tokens with it,
+            issuer <code>mcpx</code>, audience <code>{{ server.name }}</code>.
+          </p>
+          <div class="flex items-center gap-2">
+            <code class="flex-1 break-all">{{ identitySecret }}</code>
+            <button @click="copyIdentitySecret" class="btn btn-secondary">{{ identityCopied ? 'Copied' : 'Copy' }}</button>
+          </div>
+        </div>
+        <p v-if="identityError" class="text-red-400 text-sm mt-2">{{ identityError }}</p>
+      </div>
+
       <!-- Server Info -->
       <div class="card">
         <h3 class="font-semibold mb-3 flex items-center gap-2">
@@ -198,6 +243,10 @@
           <div class="flex justify-between">
             <span class="text-gray-400">Authentication:</span>
             <span class="capitalize">{{ server.auth_type?.replace('_', ' ') || 'None' }}</span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-400">Caller identity:</span>
+            <span>{{ server.forward_identity ? 'Forwarded' : 'Not forwarded' }}</span>
           </div>
           <div class="flex justify-between">
             <span class="text-gray-400">Created:</span>
@@ -241,7 +290,8 @@ import {
   ShieldCheckIcon,
   CommandLineIcon,
   ChevronDownIcon,
-  ClockIcon
+  ClockIcon,
+  IdentificationIcon
 } from '@heroicons/vue/24/outline'
 
 const route = useRoute()
@@ -264,6 +314,11 @@ const rateLimitInput = ref<number | null>(null)
 const savingRateLimit = ref(false)
 const rateLimitSuccess = ref(false)
 const rateLimitError = ref<string | null>(null)
+
+const savingIdentity = ref(false)
+const identitySecret = ref<string | null>(null)
+const identityCopied = ref(false)
+const identityError = ref<string | null>(null)
 
 const HEALTH_CHECK_INTERVAL_SECONDS = 300 // 5 minutes
 
@@ -422,6 +477,50 @@ async function handleSaveRateLimit() {
   } finally {
     savingRateLimit.value = false
   }
+}
+
+interface IdentityResponse {
+  forward_identity: boolean
+  identity_secret?: string
+}
+
+async function saveIdentity(request: () => Promise<{ data: IdentityResponse }>, failure: string) {
+  if (!server.value) return
+  savingIdentity.value = true
+  identityError.value = null
+  identityCopied.value = false
+  try {
+    const { data } = await request()
+    identitySecret.value = data.identity_secret ?? null
+    await serversStore.fetchServers()
+    server.value = serversStore.getServerByName(server.value.name) || null
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: string } }
+    identityError.value = err.response?.data || failure
+  } finally {
+    savingIdentity.value = false
+  }
+}
+
+async function handleIdentityToggle() {
+  if (!server.value) return
+  const name = server.value.name
+  const enabled = !server.value.forward_identity
+  if (!enabled && !window.confirm('Turn off identity forwarding? The secret is deleted and the server stops receiving X-MCPX-Identity.')) return
+  await saveIdentity(() => api.put(`/servers/${name}/identity`, { enabled }), 'Failed to update identity forwarding')
+}
+
+async function handleIdentityRotate() {
+  if (!server.value) return
+  const name = server.value.name
+  if (!window.confirm('Rotate the identity secret? The current secret stops working immediately.')) return
+  await saveIdentity(() => api.post(`/servers/${name}/identity/rotate`), 'Failed to rotate the identity secret')
+}
+
+async function copyIdentitySecret() {
+  if (!identitySecret.value) return
+  await navigator.clipboard.writeText(identitySecret.value)
+  identityCopied.value = true
 }
 
 async function handleAuthorize() {

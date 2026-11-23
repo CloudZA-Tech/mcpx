@@ -8,6 +8,11 @@ pub mod error {
     pub const USER_NOT_FOUND: &str = "User not found";
     pub const SERVER_NOT_FOUND: &str = "Server not found";
     pub const SERVER_DISABLED: &str = "Server is disabled";
+    pub const IDENTITY_SECRET_MISSING: &str =
+        "Identity forwarding is on but the server has no identity secret";
+    pub const IDENTITY_FORWARDING_FAILED: &str = "Identity forwarding failed";
+    pub const IDENTITY_NOT_ENABLED: &str =
+        "Identity forwarding is off for this server; turn it on first";
     pub const INVALID_USER_ID: &str = "Invalid user ID";
     pub const DATABASE_ERROR: &str = "Database error";
     pub const JWT_ERROR: &str = "JWT error";

@@ -11,13 +11,14 @@ use uuid::Uuid;
 
 use crate::messages::error;
 use crate::services::crypto;
+use crate::services::identity::{self, Caller, CallerKind};
 use crate::services::mcp_client;
 use crate::services::metrics::RequestMetric;
 use crate::AppState;
 
 // SQL queries now use org_id/org_slug instead of user_id
 const SQL_SELECT_ORG_BY_SLUG: &str = "SELECT id FROM organizations WHERE slug = $1";
-const SQL_SELECT_SERVER: &str = "SELECT id, org_id, name, url, transport, auth_type, status, oauth_client_id, oauth_token_url, rate_limit_per_minute FROM servers WHERE name = $1 AND org_id = $2";
+const SQL_SELECT_SERVER: &str = "SELECT id, org_id, name, url, transport, auth_type, status, oauth_client_id, oauth_token_url, rate_limit_per_minute, forward_identity FROM servers WHERE name = $1 AND org_id = $2";
 const SQL_SELECT_GOVERNANCE: &str =
     "SELECT allowed_tools, denied_tools, tool_prefix FROM governance_configs WHERE server_id = $1";
 
@@ -26,7 +27,7 @@ const SQL_SELECT_GATEWAY: &str = r#"
 "#;
 
 const SQL_SELECT_GATEWAY_SERVERS: &str = r#"
-    SELECT s.id, s.org_id, s.name, s.url, s.transport, s.auth_type, s.status, s.oauth_client_id, s.oauth_token_url, s.rate_limit_per_minute
+    SELECT s.id, s.org_id, s.name, s.url, s.transport, s.auth_type, s.status, s.oauth_client_id, s.oauth_token_url, s.rate_limit_per_minute, s.forward_identity
     FROM gateway_servers gs
     JOIN servers s ON s.id = gs.server_id
     WHERE gs.gateway_id = $1
@@ -49,6 +50,8 @@ pub struct AuthResult {
     pub org_id: Uuid,
     /// Scopes from M2M token. None = PAT (full access), Some([]) = no scopes
     pub scopes: Option<Vec<String>>,
+    /// The caller's IP address, when MCPx is told how many proxies to trust (TRUSTED_PROXY_HOPS)
+    pub client_ip: Option<String>,
 }
 
 impl AuthResult {
@@ -57,6 +60,20 @@ impl AuthResult {
         match &self.scopes {
             None => true, // PAT = full access
             Some(scopes) => scopes.iter().any(|s| s == scope),
+        }
+    }
+
+    /// PATs belong to users; M2M tokens belong to service accounts.
+    pub fn caller(&self) -> Caller {
+        Caller {
+            id: self.user_or_sa_id,
+            org_id: self.org_id,
+            kind: if self.scopes.is_none() {
+                CallerKind::User
+            } else {
+                CallerKind::ServiceAccount
+            },
+            ip: self.client_ip.clone(),
         }
     }
 }
@@ -124,7 +141,8 @@ pub async fn mcp_proxy(
     );
 
     // Extract and validate authentication - returns AuthResult with scopes
-    let auth = authenticate_request(&state, &headers).await?;
+    let mut auth = authenticate_request(&state, &headers).await?;
+    auth.client_ip = identity::client_ip(&headers, state.config.trusted_proxy_hops);
 
     // Look up org by slug
     let org_id: Uuid = sqlx::query_scalar(SQL_SELECT_ORG_BY_SLUG)
@@ -227,6 +245,7 @@ async fn authenticate_request(
                     user_or_sa_id: pat.user_id,
                     org_id: pat.org_id,
                     scopes: None, // PAT = full access
+                    client_ip: None,
                 })
             }
             None => Err((
@@ -294,6 +313,7 @@ fn validate_m2m_jwt(token: &str, secret: &str) -> Result<AuthResult, (StatusCode
         user_or_sa_id: service_account_id,
         org_id,
         scopes: Some(claims.scopes),
+        client_ip: None,
     })
 }
 
@@ -346,12 +366,14 @@ async fn handle_server_proxy(
         )
     })?;
 
-    let auth_headers = build_auth_headers(state, &server).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{}: {}", error::AUTH_ERROR, e),
-        )
-    })?;
+    let auth_headers = build_auth_headers(state, &server, auth)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{}: {}", error::AUTH_ERROR, e),
+            )
+        })?;
 
     let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
         .await
@@ -634,6 +656,7 @@ async fn handle_gateway_proxy(
         "initialize" => {
             handle_gateway_initialize(
                 state,
+                auth,
                 &gateway,
                 org_id,
                 &servers,
@@ -645,6 +668,7 @@ async fn handle_gateway_proxy(
         "tools/list" => {
             handle_gateway_tools_list(
                 state,
+                auth,
                 &gateway,
                 &servers,
                 headers.clone(),
@@ -656,6 +680,7 @@ async fn handle_gateway_proxy(
         "tools/call" => {
             handle_gateway_tools_call(
                 state,
+                auth,
                 &gateway,
                 &servers,
                 headers.clone(),
@@ -667,7 +692,7 @@ async fn handle_gateway_proxy(
         _ => {
             // For other methods (like notifications/initialized), translate gateway session to server session
             if let Some(server) = servers.first() {
-                let auth_headers = build_auth_headers(state, server).await.map_err(|e| {
+                let auth_headers = build_auth_headers(state, server, auth).await.map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("{}: {}", error::AUTH_ERROR, e),
@@ -881,6 +906,7 @@ async fn handle_gateway_proxy(
 
 async fn handle_gateway_initialize(
     state: &AppState,
+    auth: &AuthResult,
     gateway: &GatewayRow,
     org_id: Uuid,
     servers: &[ServerRow],
@@ -893,7 +919,7 @@ async fn handle_gateway_initialize(
     let mut last_response: Option<Response> = None;
 
     for server in servers {
-        let auth_headers = build_auth_headers(state, server).await.map_err(|e| {
+        let auth_headers = build_auth_headers(state, server, auth).await.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("{}: {}", error::AUTH_ERROR, e),
@@ -963,6 +989,7 @@ async fn handle_gateway_initialize(
 
 async fn handle_gateway_tools_list(
     state: &AppState,
+    auth: &AuthResult,
     _gateway: &GatewayRow,
     servers: &[ServerRow],
     _headers: HeaderMap,
@@ -985,11 +1012,22 @@ async fn handle_gateway_tools_list(
             .unwrap_or_default();
 
         let (auth_header_name, auth_header_value) = get_server_auth_headers(state, server).await;
+        let mut extra_headers = Vec::new();
+        if server.forward_identity {
+            match identity_header(state, server, auth).await {
+                Ok(h) => extra_headers.push(h),
+                Err(e) => {
+                    tracing::warn!("Skipping '{}' in tools/list: {}", server.name, e);
+                    continue;
+                }
+            }
+        }
 
         let tools = mcp_client::list_tools_from_server(
             &server.url,
             auth_header_name.as_deref(),
             auth_header_value.as_deref(),
+            &extra_headers,
         )
         .await;
 
@@ -1039,6 +1077,7 @@ async fn handle_gateway_tools_list(
 
 async fn handle_gateway_tools_call(
     state: &AppState,
+    auth: &AuthResult,
     _gateway: &GatewayRow,
     servers: &[ServerRow],
     headers: HeaderMap,
@@ -1134,7 +1173,7 @@ async fn handle_gateway_tools_call(
             )
         })?;
 
-        let auth_headers = build_auth_headers(state, server).await.map_err(|e| {
+        let auth_headers = build_auth_headers(state, server, auth).await.map_err(|e| {
             tracing::error!("Auth error for server '{}': {}", server.name, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1278,6 +1317,7 @@ struct ServerRow {
     oauth_client_id: Option<String>,
     oauth_token_url: Option<String>,
     rate_limit_per_minute: Option<i32>,
+    forward_identity: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1553,6 +1593,7 @@ fn filter_tools(tools: &[McpTool], governance: &GovernanceConfig) -> Vec<McpTool
 async fn build_auth_headers(
     state: &AppState,
     server: &ServerRow,
+    auth: &AuthResult,
 ) -> Result<Vec<(String, String)>, String> {
     let mut headers = Vec::new();
 
@@ -1634,7 +1675,27 @@ async fn build_auth_headers(
         }
     }
 
+    if server.forward_identity {
+        headers.push(identity_header(state, server, auth).await?);
+    }
+
     Ok(headers)
+}
+
+async fn identity_header(
+    state: &AppState,
+    server: &ServerRow,
+    auth: &AuthResult,
+) -> Result<(String, String), String> {
+    identity::identity_header(
+        &state.db.pool,
+        &state.config.encryption_key,
+        server.id,
+        &server.name,
+        &auth.caller(),
+    )
+    .await
+    .map_err(|e| format!("{}: {}", error::IDENTITY_FORWARDING_FAILED, e))
 }
 
 async fn get_credential(
@@ -2098,6 +2159,7 @@ mod tests {
                 user_or_sa_id: Uuid::new_v4(),
                 org_id: Uuid::new_v4(),
                 scopes,
+                client_ip: None,
             }
         }
 
@@ -2141,6 +2203,7 @@ mod tests {
                 user_or_sa_id: Uuid::new_v4(),
                 org_id: Uuid::new_v4(),
                 scopes: None,
+                client_ip: None,
             }
         }
 
@@ -2149,6 +2212,7 @@ mod tests {
                 user_or_sa_id: Uuid::new_v4(),
                 org_id: Uuid::new_v4(),
                 scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
+                client_ip: None,
             }
         }
 
@@ -2347,6 +2411,7 @@ mod authorization_tests {
             user_or_sa_id,
             org_id,
             scopes: None, // PAT full access
+            client_ip: None,
         }
     }
 
